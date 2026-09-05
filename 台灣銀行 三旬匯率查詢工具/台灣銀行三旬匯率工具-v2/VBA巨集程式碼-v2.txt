@@ -1,0 +1,631 @@
+Option Explicit
+
+'=====================================================================
+' 台灣銀行 三旬匯率查詢工具 - VBA 巨集（v3）
+' 使用方式：Alt+F11 開啟 VBA 編輯器 -> 插入 -> 模組(Module) -> 貼上本檔全部內容
+'
+' 本版新增：
+'   1. DownloadCurrentRate：下載「現在」即時匯率，寫入/更新「匯率表」最後一列
+'   2. 圖表幣別篩選：ShowAllSeries / ShowUSDOnly / ShowJPYOnly / ShowCNYOnly
+'      （對應「匯率表」F20/H20/J20/L20 的 4 個按鈕色塊）
+'=====================================================================
+
+Private Const SHEET_RATE As String = "匯率表"
+Private Const DAYS_BACK As Long = 30          '三旬 = 30 天
+
+'---------------------------------------------------------------------
+' 按鍵1【下載三旬匯率】：從臺灣銀行下載 USD/JPY/CNY 近三旬匯率到「匯率表」
+'---------------------------------------------------------------------
+Sub DownloadRates()
+
+    Dim wsRate As Worksheet
+    Dim currencies As Variant
+    Dim dictAll As Object          '日期字串 -> Dictionary(幣別 -> 匯率)
+    Dim i As Long
+    Dim rowCount As Long
+
+    On Error GoTo ErrHandler
+    Application.ScreenUpdating = False
+    Application.Cursor = xlWait
+
+    currencies = Array("USD", "JPY", "CNY")
+
+    Set wsRate = GetOrCreateSheet(SHEET_RATE)
+    wsRate.Cells.Clear
+
+    wsRate.Range("A1").Value = "日期"
+    wsRate.Range("B1").Value = "USD 美元"
+    wsRate.Range("C1").Value = "JPY 日圓"
+    wsRate.Range("D1").Value = "CNY 人民幣"
+    wsRate.Range("A1:D1").Font.Bold = True
+    wsRate.Range("A1:D1").Interior.Color = RGB(31, 78, 120)
+    wsRate.Range("A1:D1").Font.Color = RGB(255, 255, 255)
+
+    Set dictAll = CreateObject("Scripting.Dictionary")
+
+    For i = LBound(currencies) To UBound(currencies)
+        Application.StatusBar = "正在下載 " & currencies(i) & " 歷史匯率..."
+        FetchCurrencyHistory CStr(currencies(i)), dictAll
+    Next i
+
+    rowCount = WriteRatesToSheet(dictAll, wsRate)
+
+    wsRate.Columns("A:D").AutoFit
+    wsRate.Activate
+    wsRate.Range("A1").Select
+
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.Cursor = xlDefault
+
+    If rowCount = 0 Then
+        MsgBox "未取得任何匯率資料，請確認網路連線，或臺灣銀行網站結構是否變動。", vbExclamation
+    Else
+        MsgBox "三旬匯率下載完成！共取得 " & rowCount & " 天資料。", vbInformation
+    End If
+    Exit Sub
+
+ErrHandler:
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.Cursor = xlDefault
+    MsgBox "下載匯率時發生錯誤：" & vbCrLf & "錯誤代碼 " & Err.Number & vbCrLf & Err.Description, vbCritical
+End Sub
+
+'---------------------------------------------------------------------
+' 按鍵3【下載現在匯率】：抓即時匯率，更新/新增「匯率表」最後一列
+'---------------------------------------------------------------------
+Sub DownloadCurrentRate()
+
+    Dim wsRate As Worksheet
+    Dim html As String
+    Dim dictCurrent As Object
+    Dim targetRow As Long
+    Dim todayDate As Date
+
+    On Error GoTo ErrHandler
+    Application.ScreenUpdating = False
+    Application.Cursor = xlWait
+    Application.StatusBar = "正在下載即時匯率..."
+
+    Set wsRate = GetOrCreateSheet(SHEET_RATE)
+
+    ' 若「匯率表」還沒有表頭（例如尚未按過【下載三旬匯率】），先建立表頭
+    If Trim(wsRate.Range("A1").Value) = "" Then
+        wsRate.Range("A1").Value = "日期"
+        wsRate.Range("B1").Value = "USD 美元"
+        wsRate.Range("C1").Value = "JPY 日圓"
+        wsRate.Range("D1").Value = "CNY 人民幣"
+        wsRate.Range("A1:D1").Font.Bold = True
+        wsRate.Range("A1:D1").Interior.Color = RGB(31, 78, 120)
+        wsRate.Range("A1:D1").Font.Color = RGB(255, 255, 255)
+    End If
+
+    Set dictCurrent = CreateObject("Scripting.Dictionary")
+
+    html = HttpGet("https://rate.bot.com.tw/xrt?Lang=zh-TW")
+    If Len(html) = 0 Then
+        MsgBox "無法連線臺灣銀行網站，請確認網路連線。", vbExclamation
+        GoTo CleanExit
+    End If
+
+    ParseCurrentRateTable html, dictCurrent
+
+    If dictCurrent.Count = 0 Then
+        MsgBox "未取得即時匯率資料，可能是臺灣銀行網站結構變動，請稍後再試。", vbExclamation
+        GoTo CleanExit
+    End If
+
+    todayDate = Date
+    targetRow = FindOrAppendDateRow(wsRate, todayDate)
+
+    wsRate.Cells(targetRow, 1).Value = todayDate
+    wsRate.Cells(targetRow, 1).NumberFormat = "yyyy/mm/dd"
+    If dictCurrent.Exists("USD") Then wsRate.Cells(targetRow, 2).Value = dictCurrent("USD")
+    If dictCurrent.Exists("JPY") Then wsRate.Cells(targetRow, 3).Value = dictCurrent("JPY")
+    If dictCurrent.Exists("CNY") Then wsRate.Cells(targetRow, 4).Value = dictCurrent("CNY")
+
+    wsRate.Columns("A:D").AutoFit
+    wsRate.Activate
+    wsRate.Cells(targetRow, 1).Select
+
+    MsgBox "現在匯率已更新至 " & Format(todayDate, "yyyy/mm/dd") & " 這一列。", vbInformation
+
+CleanExit:
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.Cursor = xlDefault
+    Exit Sub
+
+ErrHandler:
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.Cursor = xlDefault
+    MsgBox "下載現在匯率時發生錯誤：" & vbCrLf & "錯誤代碼 " & Err.Number & vbCrLf & Err.Description, vbCritical
+End Sub
+
+'---------------------------------------------------------------------
+' 按鍵2【匯率轉成圖表】：依「匯率表」資料畫出三幣別對台幣的趨勢折線圖
+'---------------------------------------------------------------------
+Sub MakeChart()
+
+    Dim wsRate As Worksheet
+    Dim lastRow As Long
+    Dim chtObj As ChartObject
+    Dim rngCat As Range
+    Dim co As ChartObject
+    Dim s As Series
+
+    On Error GoTo ErrHandler
+
+    Set wsRate = GetOrCreateSheet(SHEET_RATE)
+    lastRow = wsRate.Cells(wsRate.Rows.Count, "A").End(xlUp).Row
+
+    If lastRow < 2 Then
+        MsgBox "「匯率表」目前沒有資料，請先點選【下載三旬匯率】。", vbExclamation
+        Exit Sub
+    End If
+
+    For Each co In wsRate.ChartObjects
+        co.Delete
+    Next co
+
+    Set rngCat = wsRate.Range("A2:A" & lastRow)
+
+    Set chtObj = wsRate.ChartObjects.Add(Left:=wsRate.Range("F2").Left, _
+                                          Top:=wsRate.Range("F2").Top, _
+                                          Width:=560, Height:=320)
+    chtObj.Name = "RateTrendChart"
+
+    With chtObj.Chart
+        .ChartType = xlLine
+
+        .SeriesCollection.NewSeries
+        .SeriesCollection(1).Values = wsRate.Range("B2:B" & lastRow)
+        .SeriesCollection(1).Name = "='" & SHEET_RATE & "'!$B$1"
+
+        .SeriesCollection.NewSeries
+        .SeriesCollection(2).Values = wsRate.Range("C2:C" & lastRow)
+        .SeriesCollection(2).Name = "='" & SHEET_RATE & "'!$C$1"
+
+        .SeriesCollection.NewSeries
+        .SeriesCollection(3).Values = wsRate.Range("D2:D" & lastRow)
+        .SeriesCollection(3).Name = "='" & SHEET_RATE & "'!$D$1"
+
+        ' 明確指定每條線的顏色/粗細/樣式，避免「自動」格式在未手動套用
+        ' 圖表樣式前不顯示線條的問題
+        Dim lineColors As Variant
+        Dim idx As Long
+        lineColors = Array(RGB(68, 114, 196), RGB(112, 173, 71), RGB(192, 0, 0))
+
+        idx = 0
+        For Each s In .SeriesCollection
+            s.XValues = rngCat
+            s.ChartType = xlLine
+            s.MarkerStyle = xlMarkerStyleNone
+            With s.Format.Line
+                .Visible = msoTrue
+                .Weight = 2.25
+                .ForeColor.RGB = lineColors(idx)
+            End With
+            idx = idx + 1
+        Next s
+
+        .HasTitle = True
+        .ChartTitle.Text = "近三旬匯率趨勢（USD／JPY／CNY 對台幣）"
+
+        .Axes(xlCategory, xlPrimary).HasTitle = True
+        .Axes(xlCategory, xlPrimary).AxisTitle.Text = "日期"
+        .Axes(xlValue, xlPrimary).HasTitle = True
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "匯率（兌台幣）"
+
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+
+        ' 強制重新套用圖表樣式，等同手動點一次圖表樣式，
+        ' 讓剛才設定的線條格式真正繪製出來，不需使用者手動操作
+        .ChartStyle = 2
+        DoEvents
+        .ChartStyle = 1
+    End With
+
+    wsRate.Calculate
+
+    MsgBox "趨勢圖已產生完成！可用圖表下方的 4 個按鈕（全部／USD／JPY／CNY）切換顯示的幣別曲線。", vbInformation
+    Exit Sub
+
+ErrHandler:
+    MsgBox "產生圖表時發生錯誤：" & vbCrLf & "錯誤代碼 " & Err.Number & vbCrLf & Err.Description, vbCritical
+End Sub
+
+'---------------------------------------------------------------------
+' 圖表幣別篩選按鈕：分別指定給 4 個表單控制項按鈕
+' 「全部」按鈕 -> ShowAllSeries
+' 「USD」按鈕  -> ShowUSDOnly
+' 「JPY」按鈕  -> ShowJPYOnly
+' 「CNY」按鈕  -> ShowCNYOnly
+'---------------------------------------------------------------------
+Sub ShowAllSeries()
+    FilterChartSeries "ALL"
+End Sub
+
+Sub ShowUSDOnly()
+    FilterChartSeries "USD"
+End Sub
+
+Sub ShowJPYOnly()
+    FilterChartSeries "JPY"
+End Sub
+
+Sub ShowCNYOnly()
+    FilterChartSeries "CNY"
+End Sub
+
+Private Sub FilterChartSeries(ByVal which As String)
+    Dim wsRate As Worksheet
+    Dim chtObj As ChartObject
+    Dim s As Series
+    Dim showThis As Boolean
+
+    On Error GoTo ErrHandler
+
+    Set wsRate = GetOrCreateSheet(SHEET_RATE)
+
+    On Error Resume Next
+    Set chtObj = wsRate.ChartObjects("RateTrendChart")
+    On Error GoTo ErrHandler
+
+    If chtObj Is Nothing Then
+        MsgBox "找不到趨勢圖，請先點選【匯率轉成圖表】產生圖表。", vbExclamation
+        Exit Sub
+    End If
+
+    For Each s In chtObj.Chart.SeriesCollection
+        Select Case which
+            Case "ALL"
+                showThis = True
+            Case "USD"
+                showThis = (InStr(1, s.Name, "USD", vbTextCompare) > 0)
+            Case "JPY"
+                showThis = (InStr(1, s.Name, "JPY", vbTextCompare) > 0)
+            Case "CNY"
+                showThis = (InStr(1, s.Name, "CNY", vbTextCompare) > 0)
+        End Select
+
+        If showThis Then
+            s.Format.Line.Visible = msoTrue
+        Else
+            s.Format.Line.Visible = msoFalse
+        End If
+    Next s
+    Exit Sub
+
+ErrHandler:
+    MsgBox "切換圖表顯示時發生錯誤：" & vbCrLf & "錯誤代碼 " & Err.Number & vbCrLf & Err.Description, vbCritical
+End Sub
+
+'=====================================================================
+' 以下為輔助函式（不需手動執行，由上面的巨集呼叫）
+'=====================================================================
+
+Private Function GetOrCreateSheet(ByVal sheetName As String) As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sheetName
+    End If
+    Set GetOrCreateSheet = ws
+End Function
+
+'在「匯率表」中尋找指定日期所在列；找不到則回傳「最後一列的下一列」
+Private Function FindOrAppendDateRow(ByRef ws As Worksheet, ByVal dt As Date) As Long
+    Dim lastRow As Long
+    Dim r As Long
+
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then
+        FindOrAppendDateRow = 2
+        Exit Function
+    End If
+
+    For r = 2 To lastRow
+        If IsDate(ws.Cells(r, 1).Value) Then
+            If CDate(ws.Cells(r, 1).Value) = dt Then
+                FindOrAppendDateRow = r
+                Exit Function
+            End If
+        End If
+    Next r
+
+    FindOrAppendDateRow = lastRow + 1
+End Function
+
+'抓取單一幣別「本月＋上月」歷史匯率頁面，篩選近 DAYS_BACK 天，寫入 dictAll
+Private Sub FetchCurrencyHistory(ByVal ccy As String, ByRef dictAll As Object)
+    Dim months As Variant
+    Dim m As Variant
+    Dim html As String
+    Dim url As String
+
+    months = Array(Format(Date, "yyyy-mm"), Format(DateAdd("m", -1, Date), "yyyy-mm"))
+
+    For Each m In months
+        url = "https://rate.bot.com.tw/xrt/quote/" & m & "/" & ccy
+        html = HttpGet(url)
+        If Len(html) > 0 Then
+            ParseMonthTable html, ccy, dictAll
+        End If
+    Next m
+End Sub
+
+'以 XMLHTTP 取得網頁原始 HTML
+Private Function HttpGet(ByVal url As String) As String
+    Dim http As Object
+    On Error GoTo Fail
+    Set http = CreateObject("MSXML2.XMLHTTP.6.0")
+    http.Open "GET", url, False
+    http.setRequestHeader "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VBA-Excel"
+    http.send
+    If http.Status = 200 Then
+        HttpGet = http.responseText
+    Else
+        HttpGet = ""
+    End If
+    Exit Function
+Fail:
+    HttpGet = ""
+End Function
+
+'解析歷史匯率月份表格：找出「日期,現金買,現金賣,即期買,即期賣」樣式的資料列
+Private Sub ParseMonthTable(ByVal html As String, ByVal ccy As String, ByRef dictAll As Object)
+    Dim tables() As String
+    Dim t As Long
+    Dim rows() As String
+    Dim r As Long
+    Dim cells As Collection
+    Dim dateText As String
+    Dim dTmp As Date
+    Dim spotBuy As Double, spotSell As Double
+    Dim cutoff As Date
+    Dim matched As Long
+
+    cutoff = Date - DAYS_BACK
+    matched = 0
+
+    tables = SplitAllTables(html)
+    If UBound(tables) < 0 Then Exit Sub
+
+    For t = 0 To UBound(tables)
+        rows = Split(tables(t), "<tr")
+        For r = 1 To UBound(rows)
+            On Error Resume Next
+            Set cells = Nothing
+            Set cells = CellsFromRow(rows(r))
+            On Error GoTo 0
+
+            If Not cells Is Nothing Then
+                If cells.Count >= 5 Then
+                    dateText = Trim(StripHtml(CStr(cells(1))))
+                    If TryParseDate(dateText, dTmp) Then
+                        If dTmp >= cutoff And dTmp <= Date Then
+                            If IsNumericText(CStr(cells(4))) And IsNumericText(CStr(cells(5))) Then
+                                spotBuy = CDbl(Trim(StripHtml(CStr(cells(4)))))
+                                spotSell = CDbl(Trim(StripHtml(CStr(cells(5)))))
+                                SaveRate dictAll, dTmp, ccy, (spotBuy + spotSell) / 2
+                                matched = matched + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next r
+        If matched > 0 Then Exit For
+    Next t
+End Sub
+
+'解析臺灣銀行首頁「牌告匯率」表格，取出 USD/JPY/CNY 的即期匯率(買賣平均)
+Private Sub ParseCurrentRateTable(ByVal html As String, ByRef dictCurrent As Object)
+    Dim tables() As String
+    Dim t As Long
+    Dim rows() As String
+    Dim r As Long
+    Dim cells As Collection
+    Dim nameText As String
+    Dim spotBuy As Double, spotSell As Double
+    Dim ccyCodes As Variant
+    Dim k As Long
+    Dim matched As Long
+
+    ccyCodes = Array("USD", "JPY", "CNY")
+    matched = 0
+
+    tables = SplitAllTables(html)
+    If UBound(tables) < 0 Then Exit Sub
+
+    For t = 0 To UBound(tables)
+        rows = Split(tables(t), "<tr")
+        For r = 1 To UBound(rows)
+            On Error Resume Next
+            Set cells = Nothing
+            Set cells = CellsFromRow(rows(r))
+            On Error GoTo 0
+
+            If Not cells Is Nothing Then
+                If cells.Count >= 5 Then
+                    nameText = UCase(StripHtml(CStr(cells(1))))
+                    For k = LBound(ccyCodes) To UBound(ccyCodes)
+                        If InStr(1, nameText, CStr(ccyCodes(k)), vbTextCompare) > 0 Then
+                            If IsNumericText(CStr(cells(4))) And IsNumericText(CStr(cells(5))) Then
+                                spotBuy = CDbl(Trim(StripHtml(CStr(cells(4)))))
+                                spotSell = CDbl(Trim(StripHtml(CStr(cells(5)))))
+                                If Not dictCurrent.Exists(CStr(ccyCodes(k))) Then
+                                    dictCurrent.Add CStr(ccyCodes(k)), (spotBuy + spotSell) / 2
+                                    matched = matched + 1
+                                End If
+                            End If
+                        End If
+                    Next k
+                End If
+            End If
+        Next r
+        If matched >= 3 Then Exit For
+    Next t
+End Sub
+
+'將整份 HTML 依序切出所有 <table>...</table> 區塊（陣列），供逐一嘗試解析
+Private Function SplitAllTables(ByVal html As String) As String()
+    Dim result() As String
+    Dim n As Long
+    Dim searchFrom As Long
+    Dim p1 As Long, p2 As Long
+
+    n = -1
+    ReDim result(0 To 100)
+    searchFrom = 1
+
+    Do
+        p1 = InStr(searchFrom, html, "<table", vbTextCompare)
+        If p1 = 0 Then Exit Do
+        p2 = InStr(p1, html, "</table>", vbTextCompare)
+        If p2 = 0 Then Exit Do
+
+        n = n + 1
+        If n > UBound(result) Then ReDim Preserve result(0 To n + 20)
+        result(n) = Mid(html, p1, p2 - p1 + Len("</table>"))
+
+        searchFrom = p2 + Len("</table>")
+    Loop
+
+    If n < 0 Then
+        ReDim result(0 To -1)
+    Else
+        ReDim Preserve result(0 To n)
+    End If
+
+    SplitAllTables = result
+End Function
+
+'將一列 <tr>...</tr> 依 <td> 拆成純文字，存入 Collection（1-based）
+Private Function CellsFromRow(ByVal rowHtml As String) As Collection
+    Dim result As New Collection
+    Dim parts() As String
+    Dim i As Long
+    Dim seg As String
+    Dim gt As Long, endPos As Long
+
+    parts = Split(rowHtml, "<td")
+
+    If UBound(parts) >= 1 Then
+        For i = 1 To UBound(parts)
+            seg = parts(i)
+            gt = InStr(seg, ">")
+            If gt > 0 Then seg = Mid(seg, gt + 1)
+            endPos = InStr(1, seg, "</td>", vbTextCompare)
+            If endPos > 0 Then seg = Left(seg, endPos - 1)
+            result.Add seg
+        Next i
+    End If
+
+    Set CellsFromRow = result
+End Function
+
+'去除 HTML 標籤與常見跳脫字元
+Private Function StripHtml(ByVal s As String) As String
+    Dim out As String
+    Dim inTag As Boolean
+    Dim i As Long, ch As String
+
+    out = ""
+    inTag = False
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        If ch = "<" Then
+            inTag = True
+        ElseIf ch = ">" Then
+            inTag = False
+        ElseIf Not inTag Then
+            out = out & ch
+        End If
+    Next i
+
+    out = Replace(out, "&nbsp;", " ")
+    out = Replace(out, "&amp;", "&")
+    StripHtml = Trim(out)
+End Function
+
+'判斷字串是否可解析為日期，格式如 2026/08/28
+Private Function TryParseDate(ByVal s As String, ByRef outDate As Date) As Boolean
+    On Error GoTo Fail
+    If Len(s) <> 10 Then GoTo Fail
+    If s Like "####/##/##" Then
+        outDate = DateSerial(CInt(Left(s, 4)), CInt(Mid(s, 6, 2)), CInt(Mid(s, 9, 2)))
+        TryParseDate = True
+    Else
+        GoTo Fail
+    End If
+    Exit Function
+Fail:
+    TryParseDate = False
+End Function
+
+Private Function IsNumericText(ByVal s As String) As Boolean
+    Dim t As String
+    t = Trim(StripHtml(s))
+    IsNumericText = (Len(t) > 0) And IsNumeric(t)
+End Function
+
+'將某幣別某日期的匯率存入巢狀字典 dictAll(日期字串)(幣別)
+Private Sub SaveRate(ByRef dictAll As Object, ByVal dt As Date, ByVal ccy As String, ByVal rate As Double)
+    Dim key As String
+    Dim inner As Object
+
+    key = Format(dt, "yyyy-mm-dd")
+    If Not dictAll.Exists(key) Then
+        Set inner = CreateObject("Scripting.Dictionary")
+        dictAll.Add key, inner
+    Else
+        Set inner = dictAll(key)
+    End If
+    inner(ccy) = rate
+End Sub
+
+'將巢狀字典依日期排序後寫入工作表，回傳寫入的資料筆數
+Private Function WriteRatesToSheet(ByRef dictAll As Object, ByRef ws As Worksheet) As Long
+    Dim keys() As Variant
+    Dim i As Long, j As Long, r As Long
+    Dim inner As Object
+    Dim tmp As Variant
+
+    If dictAll.Count = 0 Then
+        WriteRatesToSheet = 0
+        Exit Function
+    End If
+
+    keys = dictAll.Keys
+
+    If UBound(keys) > LBound(keys) Then
+        For i = LBound(keys) To UBound(keys) - 1
+            For j = i + 1 To UBound(keys)
+                If keys(i) > keys(j) Then
+                    tmp = keys(i): keys(i) = keys(j): keys(j) = tmp
+                End If
+            Next j
+        Next i
+    End If
+
+    r = 2
+    For i = LBound(keys) To UBound(keys)
+        Set inner = dictAll(keys(i))
+        ws.Cells(r, 1).Value = CDate(keys(i))
+        ws.Cells(r, 1).NumberFormat = "yyyy/mm/dd"
+        If inner.Exists("USD") Then ws.Cells(r, 2).Value = inner("USD")
+        If inner.Exists("JPY") Then ws.Cells(r, 3).Value = inner("JPY")
+        If inner.Exists("CNY") Then ws.Cells(r, 4).Value = inner("CNY")
+        r = r + 1
+    Next i
+
+    WriteRatesToSheet = r - 2
+End Function
